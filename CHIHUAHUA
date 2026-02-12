@@ -1,13 +1,12 @@
 # ==========================================
 # Chihuahua | Leyes de Ingresos 2026
-# Extrae:
-#   1) MUNICIPIO desde portada:
-#      "LEY DE INGRESOS PARA EL EJERCICIO FISCAL 2026 DEL MUNICIPIO DE:"
-#      (el nombre va después de los dos puntos)
-#   2) PRESUPUESTO desde el TOTAL (prioridad):
-#      "INGRESOS TOTALES / GLOBALES" (y fallbacks)
-# Regla: si la 1a hoja NO trae "LEY DE INGRESOS PARA EL EJERCICIO" -> se salta
-# Exporta a Excel
+# Lee SOLO:
+#   - Hoja 1 (portada) -> MUNICIPIO
+#   - Hoja "tercera desde el final" (n-2) -> PRESUPUESTO/TOTAL
+# Reglas:
+#   - Si la hoja 1 NO contiene "LEY DE INGRESOS ... PARA EL EJERCICIO" => SKIP
+#   - Si sí es Ley de Ingresos pero n < 3 => ERROR
+# Exporta Excel a: ...\HOJA_DATA\
 # ==========================================
 
 # install.packages(c("pdftools","stringr","dplyr","purrr","tibble","openxlsx"), dependencies = TRUE)
@@ -19,6 +18,9 @@ library(purrr)
 library(tibble)
 library(openxlsx)
 
+# -----------------------
+# INPUTS
+# -----------------------
 files <- c(
 "C:/Users/lmart/Downloads/Leyes Ingreso/chihuahua/2190.pdf",
 "C:/Users/lmart/Downloads/Leyes Ingreso/chihuahua/2191.pdf",
@@ -111,50 +113,48 @@ files <- c(
 "C:/Users/lmart/Downloads/Leyes Ingreso/chihuahua/2224.pdf",
 "C:/Users/lmart/Downloads/Leyes Ingreso/chihuahua/2225.pdf"
 )
+out_dir <- "C:/Users/lmart/Downloads/Leyes Ingreso/chihuahua/HOJA_DATA"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 # -----------------------
 # Helpers
 # -----------------------
 squish_all <- function(x) stringr::str_squish(x)
 
-remove_spaces_between_digits <- function(x){
-  gsub("(?<=\\d)\\s+(?=\\d)", "", x, perl = TRUE)
-}
-
-parse_pesos_num <- function(x){
-  if (is.na(x) || !nzchar(x)) return(NA_real_)
-  y <- gsub("[^0-9,\\.]", "", x)
-  y <- gsub(",", "", y)
-  suppressWarnings(as.numeric(y))
-}
-
 norm_txt <- function(x){
-  # para detección robusta (mayúsculas + sin acentos)
   x <- toupper(x)
   iconv(x, from = "UTF-8", to = "ASCII//TRANSLIT")
 }
 
-# -----------------------
-# 1) Portada: validar + municipio
-# -----------------------
+safe_filename <- function(x){
+  # Windows-safe + corto
+  x <- norm_txt(x)
+  x <- gsub("[^A-Z0-9 ]+", " ", x)
+  x <- squish_all(x)
+  x <- gsub(" ", "_", x)
+  x <- substr(x, 1, 120)
+  if (!nzchar(x)) x <- "MUNICIPIO_DESCONOCIDO"
+  x
+}
+
 has_portada_ley_ingresos <- function(page1){
   p <- norm_txt(page1)
   str_detect(p, regex("LEY\\s+DE\\s+INGRESO(?:S)?\\s+PARA\\s+EL\\s+EJERCICIO", ignore_case = TRUE))
 }
 
 extract_municipio_portada <- function(page1){
-  # Busca el bloque "... DEL MUNICIPIO DE:" y toma la primera línea no-vacía después
+  # "... DEL MUNICIPIO DE:" -> toma 1a línea no vacía después
   rx <- regex("DEL\\s+MUNICIPIO\\s+DE\\s*:\\s*", ignore_case = TRUE)
 
-  if (!str_detect(page1, rx)) {
-    # fallback por si viene sin ":" (raro)
+  after <- if (str_detect(page1, rx)) {
+    tmp <- str_split(page1, rx, n = 2)[[1]]
+    if (length(tmp) >= 2) tmp[2] else ""
+  } else {
+    # fallback sin ":" si viene raro
     rx2 <- regex("DEL\\s+MUNICIPIO\\s+DE\\s+", ignore_case = TRUE)
     if (!str_detect(page1, rx2)) return(NA_character_)
-    after <- str_split(page1, rx2, n = 2)[[1]]
-    after <- if (length(after) >= 2) after[2] else ""
-  } else {
-    after <- str_split(page1, rx, n = 2)[[1]]
-    after <- if (length(after) >= 2) after[2] else ""
+    tmp <- str_split(page1, rx2, n = 2)[[1]]
+    if (length(tmp) >= 2) tmp[2] else ""
   }
 
   lines <- str_split(after, "\n")[[1]]
@@ -163,10 +163,10 @@ extract_municipio_portada <- function(page1){
   if (length(lines) == 0) return(NA_character_)
 
   muni <- squish_all(lines[1])
-  muni <- gsub("[[:punct:]]+$", "", muni)     # quita puntos/comedias al final
+  muni <- gsub("[[:punct:]]+$", "", muni)
   muni <- squish_all(muni)
 
-  # corta si por alguna razón viene pegado un monto
+  # corta si se pegó un monto o números
   muni <- sub("\\s+(\\$|\\d).*", "", muni, perl = TRUE)
   muni <- squish_all(muni)
 
@@ -175,129 +175,100 @@ extract_municipio_portada <- function(page1){
 }
 
 # -----------------------
-# 2) Total / Presupuesto (prioridad + fallbacks)
+# Procesar 1 PDF -> crear PDF ligero
 # -----------------------
-total_headers <- list(
-  list(rx = "INGRESOS\\s+TOTALES\\s*/?\\s*GLOBALES", label = "INGRESOS TOTALES / GLOBALES"),
-  list(rx = "TOTAL\\s+DE\\s+INGRESO(?:S)?",          label = "TOTAL DE INGRESOS"),
-  list(rx = "TOTAL\\s+GENERAL",                     label = "TOTAL GENERAL"),
-  list(rx = "GRAN\\s+TOTAL",                        label = "GRAN TOTAL")
-)
+process_one_pdf <- function(path){
 
-extract_total_from_page <- function(txt, window_chars = 2500){
-  # Limpieza suave (sin perder saltos de línea)
-  txt <- remove_spaces_between_digits(txt)
-  txt <- gsub("[ \t]+", " ", txt)
-
-  for (h in total_headers) {
-    rxh <- regex(h$rx, ignore_case = TRUE)
-    if (str_detect(txt, rxh)) {
-      parts <- str_split(txt, rxh, n = 2)[[1]]
-      tail_txt <- if (length(parts) >= 2) parts[2] else txt
-
-      win <- substr(tail_txt, 1, window_chars)
-      win <- remove_spaces_between_digits(win)
-      win <- squish_all(win)
-
-      amt <- str_extract(
-        win,
-        regex("\\$\\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})?")
-      )
-      if (is.na(amt)) {
-        amt <- str_extract(win, regex("[0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})"))
-      }
-
-      if (!is.na(amt)) {
-        return(list(
-          total_label = h$label,
-          total_txt   = squish_all(amt),
-          total_num   = parse_pesos_num(amt)
-        ))
-      }
-    }
+  # Total de páginas (rápido, sin extraer texto de todo)
+  info <- tryCatch(pdftools::pdf_info(path), error = function(e) NULL)
+  if (is.null(info) || is.null(info$pages) || is.na(info$pages)) {
+    message("ERROR info: ", basename(path))
+    return(invisible(FALSE))
   }
 
-  list(total_label = NA_character_, total_txt = NA_character_, total_num = NA_real_)
-}
-
-extract_one_pdf <- function(path){
-
-  pages <- pdftools::pdf_text(path)
-  if (length(pages) == 0) {
-    return(tibble(
-      archivo = path,
-      id_pdf = str_extract(basename(path), "\\d+"),
-      municipio = NA_character_,
-      presupuesto_2026 = NA_real_,
-      presupuesto_texto = NA_character_,
-      total_label = NA_character_,
-      pagina_total = NA_integer_,
-      estatus = "ERROR: pdf sin texto/paginas"
-    ))
+  n <- info$pages
+  if (n < 3) {
+    message("SKIP (<3 paginas, no hay n-2): ", basename(path))
+    return(invisible(FALSE))
   }
 
-  # Portada (primera hoja)
-  page1 <- pages[[1]]
+  # Extraer SOLO la portada a un PDF temporal y leer texto de esa sola página
+  tmp_cover <- tempfile(fileext = ".pdf")
+  on.exit(unlink(tmp_cover), add = TRUE)
 
-  # Si no trae la frase, se “salta” (como pediste)
-  if (!has_portada_ley_ingresos(page1)) {
-    return(tibble(
-      archivo = path,
-      id_pdf = str_extract(basename(path), "\\d+"),
-      municipio = NA_character_,
-      presupuesto_2026 = NA_real_,
-      presupuesto_texto = NA_character_,
-      total_label = NA_character_,
-      pagina_total = NA_integer_,
-      estatus = "SKIP: 1a hoja no dice 'LEY DE INGRESOS PARA EL EJERCICIO'"
-    ))
-  }
-
-  municipio <- extract_municipio_portada(page1)
-
-  # Buscar total/presupuesto en todas las páginas
-  total_label <- NA_character_
-  total_txt   <- NA_character_
-  total_num   <- NA_real_
-  pag_total   <- NA_integer_
-
-  for (i in seq_along(pages)) {
-    out <- extract_total_from_page(pages[[i]])
-    if (!is.na(out$total_num)) {
-      total_label <- out$total_label
-      total_txt   <- out$total_txt
-      total_num   <- out$total_num
-      pag_total   <- i
-      break
-    }
-  }
-
-  tibble(
-    archivo = path,
-    id_pdf = str_extract(basename(path), "\\d+"),
-    municipio = municipio,
-    presupuesto_2026 = total_num,
-    presupuesto_texto = total_txt,
-    total_label = total_label,
-    pagina_total = pag_total,
-    estatus = ifelse(is.na(total_num), "OK: municipio, pero SIN total", "OK")
+  ok_cover <- TRUE
+  tryCatch(
+    qpdf::pdf_subset(input = path, pages = 1, output = tmp_cover),
+    error = function(e) ok_cover <<- FALSE
   )
+  if (!ok_cover) {
+    message("ERROR subset portada: ", basename(path))
+    return(invisible(FALSE))
+  }
+
+  page1 <- tryCatch(pdftools::pdf_text(tmp_cover)[[1]], error = function(e) "")
+  if (!nzchar(page1) || !has_portada_ley_ingresos(page1)) {
+    message("SKIP (no es Ley de Ingresos): ", basename(path))
+    return(invisible(FALSE))
+  }
+
+  muni <- extract_municipio_portada(page1)
+  if (is.na(muni) || !nzchar(muni)) muni <- "MUNICIPIO_DESCONOCIDO"
+
+  idx_total <- n - 2  # ante-antepenúltima (tercera desde el final)
+
+  # Nombre salida = municipio (si se repite, agrega __ID)
+  id <- str_extract(basename(path), "\\d+")
+  base <- safe_filename(muni)
+
+  out_pdf <- file.path(out_dir, paste0(base, ".pdf"))
+  if (file.exists(out_pdf)) {
+    suf <- if (!is.na(id) && nzchar(id)) id else format(Sys.time(), "%Y%m%d%H%M%S")
+    out_pdf <- file.path(out_dir, paste0(base, "__", suf, ".pdf"))
+  }
+
+  # Crear PDF ligero con SOLO hojas 1 y n-2
+  ok <- TRUE
+  tryCatch(
+    qpdf::pdf_subset(input = path, pages = c(1, idx_total), output = out_pdf),
+    error = function(e){
+      ok <<- FALSE
+      message("ERROR subset final: ", basename(path), " -> ", conditionMessage(e))
+    }
+  )
+
+  if (ok) message("OK: ", basename(out_pdf), "  (", muni, ")")
+  invisible(ok)
 }
 
-# ---- correr todo ----
-res <- purrr::map_dfr(files, extract_one_pdf)
+# -----------------------
+# Run
+# -----------------------
+invisible(lapply(files, process_one_pdf))
 
-# vistazo rápido
-print(res)
+message("✅ Listo. Revisa: ", out_dir)
 
-# alerta rápida
-faltantes <- res %>% filter(estatus == "OK" & (is.na(municipio) | is.na(presupuesto_2026)))
-if (nrow(faltantes) > 0) {
-  message("⚠️ Ojo: hay PDFs con portada OK pero municipio o presupuesto NA: ",
-          paste(faltantes$id_pdf, collapse = ", "))
-}
+library(qpdf)
 
-# ---- exportar a Excel ----
-out_xlsx <- "C:/Users/lmart/Downloads/Leyes Ingreso/chihuahua/ingresos_municipios_chihuahua_2026.xlsx"
-openxlsx::write.xlsx(res, out_xlsx, overwrite = TRUE)
-message("✅ Excel guardado en: ", out_xlsx)
+out_dir <- "C:/Users/lmart/Downloads/Leyes Ingreso/chihuahua/HOJA_DATA"
+
+# Lista PDFs (los ligeros)
+pdfs <- list.files(out_dir, pattern = "\\.pdf$", full.names = TRUE)
+
+# (Opcional) orden alfabético por nombre de archivo (municipio)
+pdfs <- sort(pdfs)
+
+# Filtra PDFs válidos (qpdf falla si uno está corrupto)
+is_ok <- vapply(pdfs, function(f){
+  tryCatch({ qpdf::pdf_length(f); TRUE }, error = function(e) FALSE)
+}, logical(1))
+
+pdfs_ok <- pdfs[is_ok]
+
+if (length(pdfs_ok) == 0) stop("No hay PDFs válidos en HOJA_DATA para unir.")
+
+out_final <- file.path(out_dir, "CHIHUAHUA_LeyesIngreso_2026__LIGHT_UNIDO.pdf")
+
+qpdf::pdf_combine(input = pdfs_ok, output = out_final)
+
+message("✅ PDF final unido en: ", out_final)
