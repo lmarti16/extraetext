@@ -1,0 +1,92 @@
+# ==========================================
+# Guerrero | Leyes de Ingresos 2026
+# Descarga TODOS los PDFs del directorio:
+# https://congresogro.gob.mx/legislacion/leyes-ingresos/2026/
+# y los guarda en:
+# C:/Users/lmart/Downloads/Leyes Ingreso/guerrero/2026
+# ==========================================
+
+pkgs <- c("rvest","xml2","stringr","purrr","curl")
+to_install <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install)) install.packages(to_install)
+
+library(rvest)
+library(xml2)
+library(stringr)
+library(purrr)
+library(curl)
+
+base_url <- "https://congresogro.gob.mx/legislacion/leyes-ingresos/2026/"
+dest_dir <- "C:/Users/lmart/Downloads/Leyes Ingreso/guerrero/2026"
+dir.create(dest_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 1) Leer HTML y extraer links a PDF
+html <- read_html(base_url)
+hrefs <- html %>% html_elements("a") %>% html_attr("href")
+hrefs <- hrefs[!is.na(hrefs)]
+hrefs <- hrefs[grepl("\\.pdf($|\\?)", hrefs, ignore.case = TRUE)]
+hrefs <- hrefs[!grepl("^\\?C=", hrefs)]   # por si aparecen links de ordenamiento del índice
+
+urls <- unique(xml2::url_absolute(hrefs, base_url))
+cat("PDFs encontrados:", length(urls), "\n")
+
+# 2) Headers para evitar 403 en algunos PDFs
+h <- curl::new_handle()
+curl::handle_setopt(
+  h,
+  useragent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+)
+curl::handle_setheaders(
+  h,
+  Referer = base_url,
+  Accept  = "application/pdf,*/*;q=0.8"
+)
+
+safe_name <- function(u){
+  f <- basename(u)
+  f <- utils::URLdecode(f)
+  f <- stringr::str_replace_all(f, "[\\\\/:*?\"<>|]+", "_") # inválidos en Windows
+  f <- stringr::str_replace_all(f, "\\s+", "_")
+  f
+}
+
+download_one <- function(u){
+  fn  <- safe_name(u)
+  out <- file.path(dest_dir, fn)
+
+  # Saltar si ya existe y pesa > 0
+  if (file.exists(out) && file.info(out)$size > 0) {
+    return(c(url=u, file=out, status="skip", size_mb=round(file.info(out)$size/1024^2, 3)))
+  }
+
+  # Reintentos
+  ok <- FALSE
+  for (i in 1:4){
+    try({
+      curl::curl_download(u, destfile = out, handle = h, quiet = TRUE)
+      if (file.exists(out) && file.info(out)$size > 0) ok <- TRUE
+    }, silent = TRUE)
+
+    if (ok) break
+    if (file.exists(out)) file.remove(out)  # limpia descargas incompletas
+    Sys.sleep(0.8 * i)
+  }
+
+  if (!ok) {
+    return(c(url=u, file=out, status="fail", size_mb=NA))
+  } else {
+    return(c(url=u, file=out, status="ok", size_mb=round(file.info(out)$size/1024^2, 3)))
+  }
+}
+
+res <- purrr::map(urls, download_one)
+log_df <- as.data.frame(do.call(rbind, res), stringsAsFactors = FALSE)
+
+# size_mb a numérico
+log_df$size_mb <- suppressWarnings(as.numeric(log_df$size_mb))
+
+print(table(log_df$status, useNA = "ifany"))
+utils::write.csv(log_df, file.path(dest_dir, "_descarga_log.csv"),
+                 row.names = FALSE, fileEncoding = "UTF-8")
+
+cat("✅ Listo. Log guardado en:", file.path(dest_dir, "_descarga_log.csv"), "\n")
