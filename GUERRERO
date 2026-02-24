@@ -1,12 +1,14 @@
 # ============================
 # GUERRERO 2026 - Extraer AÑO + MUNICIPIO + TOTAL (Ley de Ingresos)
 # - Municipio + Año: desde título (varios formatos)
-# - Total: busca encabezados (incluye tu caso):
+# - Total: busca encabezados:
 #     "TOTAL, ESTIMADO DE INGRESOS 2026" / "TOTAL ESTIMADO DE INGRESOS"
 #     "SUMA TOTAL DE LOS INGRESOS"
 #     "TOTAL DE INGRESOS"
 #     "TOTAL GENERAL"
 #     "GRAN TOTAL"
+#   + Fallback por frase narrativa: "importará el total mínimo de ..."
+# - Filtro presupuesto: TOTAL >= 1,000,000
 # - Lee TODOS los PDFs de una carpeta
 # - Exporta a Excel
 # ============================
@@ -14,18 +16,20 @@
 # install.packages(c("pdftools","stringr","dplyr","purrr","tibble","openxlsx"), dependencies = TRUE)
 
 suppressPackageStartupMessages({
-  library(pdftools)
-  library(stringr)
-  library(dplyr)
-  library(purrr)
-  library(tibble)
-  library(openxlsx)
+    library(pdftools)
+    library(stringr)
+    library(dplyr)
+    library(purrr)
+    library(tibble)
+    library(openxlsx)
 })
 
 # -----------------------
-# Carpeta objetivo (Guerrero 2026)
+# Config
 # -----------------------
 dir_pdfs <- "C:/Users/lmart/Downloads/Leyes Ingreso/guerrero/2026"
+MIN_TOTAL <- 1e6
+
 files <- list.files(dir_pdfs, pattern = "\\.pdf$", full.names = TRUE, ignore.case = TRUE)
 if (length(files) == 0) stop("No encontré PDFs en: ", dir_pdfs)
 
@@ -34,362 +38,337 @@ if (length(files) == 0) stop("No encontré PDFs en: ", dir_pdfs)
 # -----------------------
 squish_all <- function(x) stringr::str_squish(x)
 
-remove_spaces_between_digits <- function(x){
-  # normaliza nbsp
-  x <- gsub("\u00A0", " ", x, fixed = TRUE)
-
-  # quita espacios entre $ y dígitos
-  x <- gsub("\\$\\s+(?=\\d)", "$", x, perl = TRUE)
-
-  # separadores de miles comunes en PDFs: ,  '  ’  ´  ʼ  ′
-  seps <- ",\\'’´ʼ′"
-
-  # quita espacios/saltos entre dígito y separador
-  x <- gsub(paste0("(?<=\\d)\\s+(?=[", seps, "])"), "", x, perl = TRUE)
-
-  # quita espacios/saltos entre separador y dígito
-  x <- gsub(paste0("(?<=[", seps, "])\\s+(?=\\d)"), "", x, perl = TRUE)
-
-  # tu original: entre dígitos
-  x <- gsub("(?<=\\d)\\s+(?=\\d)", "", x, perl = TRUE)
-
-  x
-}
-
-parse_pesos_num <- function(x){
-  if (is.na(x) || !nzchar(x)) return(NA_real_)
-  y <- x
-  y <- gsub("\u00A0", " ", y, fixed = TRUE)
-  y <- gsub("[^0-9,\\.\\'’´ʼ′$\\s]", "", y)  # conserva separadores
-  y <- gsub("\\$", "", y)
-  y <- gsub("[,\\'’´ʼ′]", "", y)             # elimina separadores de miles
-  y <- gsub("\\s+", "", y)
-  suppressWarnings(as.numeric(y))
-}
-
-# --- reemplaza tu pick_amount por este (soporta $92’757,499.05)
-pick_amount <- function(x){
-  x <- remove_spaces_between_digits(x)
-
-  seps <- ",\\'’´ʼ′"
-
-  # Montos con $:
-  # - O bien trae separadores de miles al menos una vez (54´576,875.00)
-  # - O bien trae 4+ dígitos seguidos (92757499.05)
-  rx_dollar <- regex(
-    paste0(
-      "\\$\\s*(?:",
-      "[0-9]{1,3}(?:[", seps, "][0-9]{3})+",
-      "|[0-9]{4,}",
-      ")(?:\\.[0-9]{2})?"
-    ),
-    ignore_case = TRUE
-  )
-
-  # Sin $ (solo si no hay con $): exige decimales para evitar ARTÍCULO 104, etc.
-  rx_plain <- regex(
-    paste0(
-      "(?:",
-      "[0-9]{1,3}(?:[", seps, "][0-9]{3})+",
-      "|[0-9]{4,}",
-      ")(?:\\.[0-9]{2})"
-    ),
-    ignore_case = TRUE
-  )
-
-  amts <- unlist(str_extract_all(x, rx_dollar))
-  if (length(amts) == 0) amts <- unlist(str_extract_all(x, rx_plain))
-  if (length(amts) == 0) return(NA_character_)
-
-  nums <- vapply(amts, parse_pesos_num, numeric(1))
-  if (all(is.na(nums))) return(NA_character_)
-
-  amts[which.max(nums)]
-}
-
-# Normaliza (mayúsculas + sin acentos) para búsquedas robustas
 norm_txt <- function(x){
-  x <- toupper(x)
-  iconv(x, from = "UTF-8", to = "ASCII//TRANSLIT")
+    x <- toupper(x)
+    iconv(x, from = "UTF-8", to = "ASCII//TRANSLIT")
+}
+
+remove_spaces_between_digits <- function(x){
+    x <- gsub("\u00A0", " ", x, fixed = TRUE)
+    
+    # quita espacios/saltos entre $ y dígitos (incluye \n)
+    x <- gsub("\\$\\s+(?=\\d)", "$", x, perl = TRUE)
+    
+    # separadores de miles comunes en PDFs (incluye ".")
+    seps <- ",\\.\\'’´ʼ′"
+    
+    # quita espacios/saltos entre dígito y separador
+    x <- gsub(paste0("(?<=\\d)\\s+(?=[", seps, "])"), "", x, perl = TRUE)
+    
+    # quita espacios/saltos entre separador y dígito
+    x <- gsub(paste0("(?<=[", seps, "])\\s+(?=\\d)"), "", x, perl = TRUE)
+    
+    # entre dígitos
+    x <- gsub("(?<=\\d)\\s+(?=\\d)", "", x, perl = TRUE)
+    
+    x
+}
+
+# Parse robusto:
+# - Si termina en .dd o ,dd => esos dd son decimales; todo lo demás es miles/ruido y se elimina
+# - Si no hay decimales => se toma entero (todos los dígitos)
+parse_pesos_num <- function(x){
+    if (is.na(x) || !nzchar(x)) return(NA_real_)
+    y <- x
+    y <- gsub("\u00A0", " ", y, fixed = TRUE)
+    y <- gsub("[^0-9,\\.\\'’´ʼ′$\\s]", "", y)
+    y <- gsub("\\$", "", y)
+    y <- gsub("\\s+", "", y)
+    
+    if (grepl("[\\.,]\\d{2}$", y)) {
+        dec_digits <- sub(".*[\\.,](\\d{2})$", "\\1", y)
+        int_part   <- sub("([\\.,]\\d{2})$", "", y)
+        int_digits <- gsub("[^0-9]", "", int_part)
+        if (!nzchar(int_digits)) return(NA_real_)
+        return(suppressWarnings(as.numeric(paste0(int_digits, ".", dec_digits))))
+    } else {
+        int_digits <- gsub("[^0-9]", "", y)
+        if (!nzchar(int_digits)) return(NA_real_)
+        return(suppressWarnings(as.numeric(int_digits)))
+    }
+}
+
+# Extrae montos (con o sin $) y se queda con el mayor >= MIN_TOTAL
+pick_amount_budget <- function(x, min_value = 1e6){
+    x <- remove_spaces_between_digits(x)
+    
+    seps <- ",\\.\\'’´ʼ′"
+    rx <- stringr::regex(
+        paste0(
+            "(?:\\$\\s*)?",
+            "(?:[0-9]{1,3}(?:[", seps, "][0-9]{3})+|[0-9]{4,})",
+            "(?:[\\.,][0-9]{2})?"
+        ),
+        ignore_case = TRUE
+    )
+    
+    amts <- unlist(stringr::str_extract_all(x, rx))
+    if (length(amts) == 0) return(NA_character_)
+    
+    nums <- vapply(amts, parse_pesos_num, numeric(1))
+    ok <- which(!is.na(nums) & nums >= min_value)
+    if (length(ok) == 0) return(NA_character_)
+    
+    amts[ ok[which.max(nums[ok])] ]
 }
 
 # -----------------------
 # 1) Extraer MUNICIPIO + AÑO desde el título (GUERRERO)
-#    Cubre formatos típicos:
-#    - "LEY DE INGRESOS DEL MUNICIPIO DE X, GRO., PARA EL EJERCICIO FISCAL 2026"
-#    - "LEY DE INGRESOS DEL H. AYUNTAMIENTO DE X, GUERRERO, PARA EL EJERCICIO FISCAL 2026"
-#    - "LEY DE INGRESOS DEL ESTADO DE GUERRERO PARA EL EJERCICIO FISCAL 2026" (no municipal)
 # -----------------------
 extract_muni_year_from_title <- function(txt){
-
-  t0 <- remove_spaces_between_digits(txt)
-  tN <- norm_txt(t0)
-
-  # A) Estado de Guerrero
-  pat_state <- "LEY\\s+DE\\s+INGRESO(?:S)?\\s+DEL\\s+ESTADO\\s+DE\\s+GUERRERO.*?EJERCICIO\\s+FISCAL\\s+(\\d{4})"
-  mS <- str_match(tN, regex(pat_state, ignore_case = TRUE))
-  if (!is.na(mS[1,2])) {
-    return(list(municipio = "ESTADO DE GUERRERO", anio = as.integer(mS[1,2]), fuente = "titulo_estado"))
-  }
-
-  # B) Municipio / Ayuntamiento
-  # Nota: capturamos el nombre entre "DE" y "GRO/GUERRERO/," o "PARA EL EJERCICIO..."
-  pat_muni <- paste0(
-    "LEY\\s+DE\\s+INGRESO(?:S)?\\s+",
-    "(?:DEL\\s+MUNICIPIO|DE\\s+INGRESOS\\s+DEL\\s+MUNICIPIO|DEL\\s+H\\.?\\s+AYUNTAMIENTO|DEL\\s+AYUNTAMIENTO|PARA\\s+EL\\s+MUNICIPIO)\\s+DE\\s+",
-    "(.+?)",
-    "(?:\\s*,\\s*GRO\\.?\\s*,?|\\s*,\\s*GUERRERO\\s*,?|\\s+GRO\\.?\\s+|\\s+GUERRERO\\s+|\\s*,\\s*|\\s+PARA\\s+EL\\s+EJERCICIO|\\s*;)",
-    ".*?EJERCICIO\\s+FISCAL\\s+(\\d{4})"
-  )
-
-  m <- str_match(tN, regex(pat_muni, ignore_case = TRUE))
-  if (!is.na(m[1,2]) && !is.na(m[1,3])) {
-    muni <- squish_all(m[1,2])
-    muni <- sub("\\s+(PARA|DEL|DE)\\s+.*$", "", muni)
-    muni <- squish_all(muni)
-    anio <- suppressWarnings(as.integer(m[1,3]))
-    return(list(municipio = muni, anio = anio, fuente = "titulo_muni"))
-  }
-
-  # C) Fallback: a veces aparece "MUNICIPIO DE X" sin el "LEY DE INGRESOS..." completo
-  pat_loose <- "MUNICIPIO\\s+DE\\s+(.+?)\\s*(?:,\\s*GRO\\.?|,\\s*GUERRERO|\\s+GRO\\.?|\\s+GUERRERO|\\s*,|\\s+PARA\\s+EL\\s+EJERCICIO).*?EJERCICIO\\s+FISCAL\\s+(\\d{4})"
-  m2 <- str_match(tN, regex(pat_loose, ignore_case = TRUE))
-  if (!is.na(m2[1,2]) && !is.na(m2[1,3])) {
-    muni <- squish_all(m2[1,2])
-    muni <- sub("\\s+(PARA|DEL|DE)\\s+.*$", "", muni)
-    muni <- squish_all(muni)
-    anio <- suppressWarnings(as.integer(m2[1,3]))
-    return(list(municipio = muni, anio = anio, fuente = "titulo_loose"))
-  }
-
-  list(municipio = NA_character_, anio = NA_integer_, fuente = NA_character_)
+    
+    t0 <- remove_spaces_between_digits(txt)
+    tN <- norm_txt(t0)
+    
+    # A) Estado de Guerrero
+    pat_state <- "LEY\\s+DE\\s+INGRESO(?:S)?\\s+DEL\\s+ESTADO\\s+DE\\s+GUERRERO.*?EJERCICIO\\s+FISCAL\\s+(\\d{4})"
+    mS <- str_match(tN, regex(pat_state, ignore_case = TRUE))
+    if (!is.na(mS[1,2])) {
+        return(list(municipio = "ESTADO DE GUERRERO", anio = as.integer(mS[1,2]), fuente = "titulo_estado"))
+    }
+    
+    # B) Municipio / Ayuntamiento
+    pat_muni <- paste0(
+        "LEY\\s+DE\\s+INGRESO(?:S)?\\s+",
+        "(?:DEL\\s+MUNICIPIO|DE\\s+INGRESOS\\s+DEL\\s+MUNICIPIO|DEL\\s+H\\.?\\s+AYUNTAMIENTO|DEL\\s+AYUNTAMIENTO|PARA\\s+EL\\s+MUNICIPIO)\\s+DE\\s+",
+        "(.+?)",
+        "(?:\\s*,\\s*GRO\\.?\\s*,?|\\s*,\\s*GUERRERO\\s*,?|\\s+GRO\\.?\\s+|\\s+GUERRERO\\s+|\\s*,\\s*|\\s+PARA\\s+EL\\s+EJERCICIO|\\s*;)",
+        ".*?EJERCICIO\\s+FISCAL\\s+(\\d{4})"
+    )
+    
+    m <- str_match(tN, regex(pat_muni, ignore_case = TRUE))
+    if (!is.na(m[1,2]) && !is.na(m[1,3])) {
+        muni <- squish_all(m[1,2])
+        muni <- sub("\\s+(PARA|DEL|DE)\\s+.*$", "", muni)
+        muni <- squish_all(muni)
+        anio <- suppressWarnings(as.integer(m[1,3]))
+        return(list(municipio = muni, anio = anio, fuente = "titulo_muni"))
+    }
+    
+    # C) Fallback suelto
+    pat_loose <- "MUNICIPIO\\s+DE\\s+(.+?)\\s*(?:,\\s*GRO\\.?|,\\s*GUERRERO|\\s+GRO\\.?|\\s+GUERRERO|\\s*,|\\s+PARA\\s+EL\\s+EJERCICIO).*?EJERCICIO\\s+FISCAL\\s+(\\d{4})"
+    m2 <- str_match(tN, regex(pat_loose, ignore_case = TRUE))
+    if (!is.na(m2[1,2]) && !is.na(m2[1,3])) {
+        muni <- squish_all(m2[1,2])
+        muni <- sub("\\s+(PARA|DEL|DE)\\s+.*$", "", muni)
+        muni <- squish_all(muni)
+        anio <- suppressWarnings(as.integer(m2[1,3]))
+        return(list(municipio = muni, anio = anio, fuente = "titulo_loose"))
+    }
+    
+    list(municipio = NA_character_, anio = NA_integer_, fuente = NA_character_)
 }
 
-# ========================
-# 2) TOTAL — Encabezados + Fallback por frase ("importará el total mínimo de $...")
-# ========================
-
-# (A) Encabezados tipo tabla
+# -----------------------
+# 2) TOTAL — Encabezados + Fallback por frase
+# -----------------------
 total_headers <- c(
-  "TOTAL\\s*,?\\s*ESTIMADO\\s+DE\\s+INGRESO(?:S)?\\s+\\d{4}",
-  "TOTAL\\s*,?\\s*ESTIMADO\\s+DE\\s+INGRESO(?:S)?",
-  "SUMA\\s+TOTAL\\s+DE\\s+LOS\\s+INGRESO(?:S)?",
-  "TOTAL\\s+DE\\s+INGRESO(?:S)?",
-  "TOTAL\\s+GENERAL",
-  "GRAN\\s+TOTAL"
+    "TOTAL\\s*,?\\s*ESTIMADO\\s+DE\\s+INGRESO(?:S)?\\s+\\d{4}",
+    "TOTAL\\s*,?\\s*ESTIMADO\\s+DE\\s+INGRESO(?:S)?",
+    "SUMA\\s+TOTAL\\s+DE\\s+LOS\\s+INGRESO(?:S)?",
+    "TOTAL\\s+DE\\s+INGRESO(?:S)?",
+    "TOTAL\\s+GENERAL",
+    "GRAN\\s+TOTAL"
 )
 rx_total_header <- regex(paste0("(", paste(total_headers, collapse="|"), ")"), ignore_case = TRUE)
 
-# (B) Fallback por frase narrativa (como tu ejemplo)
 total_phrase_starts <- c(
-  "IMPORTA(?:RA|RÁ)?\\s+EL\\s+TOTAL(?:\\s+(?:MINIMO|MÍNIMO|MAXIMO|MÁXIMO))?\\s+DE",
-  "IMPORTA(?:RA|RÁ)?\\s+UN\\s+TOTAL\\s+DE",
-  "IMPORTA(?:RA|RÁ)?\\s+LA\\s+CANTIDAD\\s+TOTAL\\s+DE",
-  "POR\\s+UN\\s+MONTO\\s+TOTAL\\s+DE",
-  "EL\\s+MONTO\\s+TOTAL\\s+ES\\s+DE"
+    "IMPORTA(?:RA|RÁ)?\\s+EL\\s+TOTAL(?:\\s+(?:MINIMO|MÍNIMO|MAXIMO|MÁXIMO))?\\s+DE",
+    "IMPORTA(?:RA|RÁ)?\\s+UN\\s+TOTAL\\s+DE",
+    "IMPORTA(?:RA|RÁ)?\\s+LA\\s+CANTIDAD\\s+TOTAL\\s+DE",
+    "POR\\s+UN\\s+MONTO\\s+TOTAL\\s+DE",
+    "EL\\s+MONTO\\s+TOTAL\\s+ES\\s+DE"
 )
 rx_total_phrase <- regex(paste0("(", paste(total_phrase_starts, collapse="|"), ")"), ignore_case = TRUE)
 
-# helper interno para sacar el 1er monto cercano
-pick_amount <- function(x){
-  x <- remove_spaces_between_digits(x)
-  amt <- str_extract(x, regex("\\$\\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})?"))
-  if (is.na(amt)) {
-    amt <- str_extract(x, regex("[0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})"))
-  }
-  amt
+extract_total_from_header <- function(txt, window_chars = 4500, max_lines = 18, min_total = 1e6){
+    
+    loc <- str_locate(txt, rx_total_header)
+    if (all(is.na(loc))) {
+        return(list(total_label = NA_character_, total_txt = NA_character_, total_num = NA_real_))
+    }
+    
+    total_label <- squish_all(str_sub(txt, loc[1,1], loc[1,2]))
+    tail_txt <- str_sub(txt, loc[1,2] + 1)
+    tail_txt <- remove_spaces_between_digits(tail_txt)
+    
+    tail_win <- str_sub(tail_txt, 1, window_chars)
+    amt <- pick_amount_budget(tail_win, min_value = min_total)
+    
+    if (is.na(amt)) {
+        lines <- str_split(tail_txt, "\n")[[1]]
+        block <- squish_all(paste(head(lines, max_lines), collapse = " "))
+        amt <- pick_amount_budget(block, min_value = min_total)
+    }
+    
+    list(
+        total_label = total_label,
+        total_txt   = if (!is.na(amt)) squish_all(amt) else NA_character_,
+        total_num   = if (!is.na(amt)) parse_pesos_num(amt) else NA_real_
+    )
 }
 
-extract_total_from_header <- function(txt, window_chars = 4500, max_lines = 18){
-
-  loc <- str_locate(txt, rx_total_header)
-  if (all(is.na(loc))) {
-    return(list(total_label = NA_character_, total_txt = NA_character_, total_num = NA_real_))
-  }
-
-  total_label <- squish_all(str_sub(txt, loc[1,1], loc[1,2]))
-  tail_txt <- str_sub(txt, loc[1,2] + 1)
-  tail_txt <- remove_spaces_between_digits(tail_txt)
-
-  tail_win <- str_sub(tail_txt, 1, window_chars)
-  amt <- pick_amount(tail_win)
-
-  if (is.na(amt)) {
-    lines <- str_split(tail_txt, "\n")[[1]]
-    block <- squish_all(paste(head(lines, max_lines), collapse = " "))
-    amt <- pick_amount(block)
-  }
-
-  list(
-    total_label = total_label,
-    total_txt   = if (!is.na(amt)) squish_all(amt) else NA_character_,
-    total_num   = if (!is.na(amt)) parse_pesos_num(amt) else NA_real_
-  )
-}
-
-extract_total_from_phrase <- function(txt, window_chars = 4500, max_lines = 24){
-
-  loc <- str_locate(txt, rx_total_phrase)
-  if (all(is.na(loc))) {
-    return(list(total_label = NA_character_, total_txt = NA_character_, total_num = NA_real_))
-  }
-
-  total_label <- squish_all(str_sub(txt, loc[1,1], loc[1,2]))
-  tail_txt <- str_sub(txt, loc[1,2] + 1)
-  tail_txt <- remove_spaces_between_digits(tail_txt)
-
-  tail_win <- str_sub(tail_txt, 1, window_chars)
-  amt <- pick_amount(tail_win)
-
-  if (is.na(amt)) {
-    lines <- str_split(tail_txt, "\n")[[1]]
-    block <- squish_all(paste(head(lines, max_lines), collapse = " "))
-    amt <- pick_amount(block)
-  }
-
-  list(
-    total_label = total_label,
-    total_txt   = if (!is.na(amt)) squish_all(amt) else NA_character_,
-    total_num   = if (!is.na(amt)) parse_pesos_num(amt) else NA_real_
-  )
+extract_total_from_phrase <- function(txt, window_chars = 4500, max_lines = 24, min_total = 1e6){
+    
+    loc <- str_locate(txt, rx_total_phrase)
+    if (all(is.na(loc))) {
+        return(list(total_label = NA_character_, total_txt = NA_character_, total_num = NA_real_))
+    }
+    
+    total_label <- squish_all(str_sub(txt, loc[1,1], loc[1,2]))
+    tail_txt <- str_sub(txt, loc[1,2] + 1)
+    tail_txt <- remove_spaces_between_digits(tail_txt)
+    
+    tail_win <- str_sub(tail_txt, 1, window_chars)
+    amt <- pick_amount_budget(tail_win, min_value = min_total)
+    
+    if (is.na(amt)) {
+        lines <- str_split(tail_txt, "\n")[[1]]
+        block <- squish_all(paste(head(lines, max_lines), collapse = " "))
+        amt <- pick_amount_budget(block, min_value = min_total)
+    }
+    
+    list(
+        total_label = total_label,
+        total_txt   = if (!is.na(amt)) squish_all(amt) else NA_character_,
+        total_num   = if (!is.na(amt)) parse_pesos_num(amt) else NA_real_
+    )
 }
 
 # -----------------------
 # 3) Fallback por nombre de archivo (si el PDF viene escaneado y no hay texto)
 # -----------------------
 extract_muni_year_from_filename <- function(path){
-  nm <- basename(path)
-  nm <- utils::URLdecode(nm)
-  nm0 <- tools::file_path_sans_ext(nm)
-  nmN <- norm_txt(gsub("_+", " ", nm0))
-
-  # año
-  anio <- suppressWarnings(as.integer(str_extract(nmN, "\\b(20\\d{2})\\b")))
-  if (is.na(anio)) anio <- 2026L
-
-  # municipio (si viene "MUNICIPIO DE X" o "AYUNTAMIENTO DE X")
-  pat <- "(?:MUNICIPIO\\s+DE|AYUNTAMIENTO\\s+DE)\\s+(.+?)(?:\\b20\\d{2}\\b|$)"
-  m <- str_match(nmN, pat)
-  muni <- if (!is.na(m[1,2])) squish_all(m[1,2]) else NA_character_
-
-  list(municipio = muni, anio = anio, fuente = "archivo")
+    nm <- basename(path)
+    nm <- utils::URLdecode(nm)
+    nm0 <- tools::file_path_sans_ext(nm)
+    nmN <- norm_txt(gsub("_+", " ", nm0))
+    
+    anio <- suppressWarnings(as.integer(str_extract(nmN, "\\b(20\\d{2})\\b")))
+    if (is.na(anio)) anio <- 2026L
+    
+    pat <- "(?:MUNICIPIO\\s+DE|AYUNTAMIENTO\\s+DE)\\s+(.+?)(?:\\b20\\d{2}\\b|$)"
+    m <- str_match(nmN, pat)
+    muni <- if (!is.na(m[1,2])) squish_all(m[1,2]) else NA_character_
+    
+    list(municipio = muni, anio = anio, fuente = "archivo")
 }
 
 # -----------------------
 # 4) Procesar 1 PDF
 # -----------------------
-extract_one_pdf <- function(path){
-
-  pages <- pdftools::pdf_text(path)
-
-  pages <- lapply(pages, function(x){
-    x <- remove_spaces_between_digits(x)
-    x <- gsub("[ \t]+", " ", x)
-    x
-  })
-
-  municipio <- NA_character_
-  anio <- NA_integer_
-  fuente_titulo <- NA_character_
-
-  total_txt <- NA_character_
-  total_num <- NA_real_
-  total_label <- NA_character_
-
-  pag_title <- NA_integer_
-  pag_total <- NA_integer_
-
-  for (i in seq_along(pages)) {
-    txt <- pages[[i]]
-
-    # A) MUNICIPIO + AÑO
+extract_one_pdf <- function(path, min_total = 1e6){
+    
+    pages <- pdftools::pdf_text(path)
+    
+    pages <- lapply(pages, function(x){
+        x <- remove_spaces_between_digits(x)
+        x <- gsub("[ \t]+", " ", x)
+        x
+    })
+    
+    municipio <- NA_character_
+    anio <- NA_integer_
+    fuente_titulo <- NA_character_
+    
+    total_txt <- NA_character_
+    total_num <- NA_real_
+    total_label <- NA_character_
+    
+    pag_title <- NA_integer_
+    pag_total <- NA_integer_
+    
+    for (i in seq_along(pages)) {
+        txt <- pages[[i]]
+        
+        # A) MUNICIPIO + AÑO
+        if (is.na(municipio) || is.na(anio)) {
+            out_title <- extract_muni_year_from_title(txt)
+            if (!is.na(out_title$municipio) && !is.na(out_title$anio)) {
+                municipio <- out_title$municipio
+                anio <- out_title$anio
+                fuente_titulo <- out_title$fuente
+                pag_title <- i
+            }
+        }
+        
+        # B) TOTAL (primero encabezado, si no, frase)
+        if (is.na(total_txt)) {
+            
+            if (str_detect(txt, rx_total_header)) {
+                out_total <- extract_total_from_header(txt, min_total = min_total)
+                if (!is.na(out_total$total_txt)) {
+                    total_txt   <- out_total$total_txt
+                    total_num   <- out_total$total_num
+                    total_label <- out_total$total_label
+                    pag_total   <- i
+                }
+            }
+            
+            if (is.na(total_txt) && str_detect(txt, rx_total_phrase)) {
+                out_total2 <- extract_total_from_phrase(txt, min_total = min_total)
+                if (!is.na(out_total2$total_txt)) {
+                    total_txt   <- out_total2$total_txt
+                    total_num   <- out_total2$total_num
+                    total_label <- out_total2$total_label
+                    pag_total   <- i
+                }
+            }
+        }
+        
+        if (!is.na(municipio) && !is.na(anio) && !is.na(total_txt)) break
+    }
+    
+    # Fallback por nombre de archivo (por si está escaneado)
     if (is.na(municipio) || is.na(anio)) {
-      out_title <- extract_muni_year_from_title(txt)
-      if (!is.na(out_title$municipio) && !is.na(out_title$anio)) {
-        municipio <- out_title$municipio
-        anio <- out_title$anio
-        fuente_titulo <- out_title$fuente
-        pag_title <- i
-      }
+        fb <- extract_muni_year_from_filename(path)
+        if (is.na(municipio) && !is.na(fb$municipio)) municipio <- fb$municipio
+        if (is.na(anio) && !is.na(fb$anio)) anio <- fb$anio
+        if (is.na(fuente_titulo)) fuente_titulo <- fb$fuente
     }
-
-    # B) TOTAL (primero encabezado, si no, fallback por frase)
-    if (is.na(total_txt)) {
-
-      if (str_detect(txt, rx_total_header)) {
-        out_total <- extract_total_from_header(txt)
-        if (!is.na(out_total$total_txt)) {
-          total_txt   <- out_total$total_txt
-          total_num   <- out_total$total_num
-          total_label <- out_total$total_label
-          pag_total   <- i
-        }
-      }
-
-      if (is.na(total_txt) && str_detect(txt, rx_total_phrase)) {
-        out_total2 <- extract_total_from_phrase(txt)
-        if (!is.na(out_total2$total_txt)) {
-          total_txt   <- out_total2$total_txt
-          total_num   <- out_total2$total_num
-          total_label <- out_total2$total_label
-          pag_total   <- i
-        }
-      }
-    }
-
-    if (!is.na(municipio) && !is.na(anio) && !is.na(total_txt)) break
-  }
-
-  # Fallback por nombre de archivo (por si está escaneado)
-  if (is.na(municipio) || is.na(anio)) {
-    fb <- extract_muni_year_from_filename(path)
-    if (is.na(municipio) && !is.na(fb$municipio)) municipio <- fb$municipio
-    if (is.na(anio) && !is.na(fb$anio)) anio <- fb$anio
-    if (is.na(fuente_titulo)) fuente_titulo <- fb$fuente
-  }
-
-  tibble(
-    archivo = path,
-    archivo_nombre = basename(path),
-    municipio = municipio,
-    anio = anio,
-    total_label = total_label,
-    total = total_num,
-    total_texto = total_txt,
-    pagina_titulo = pag_title,
-    pagina_total = pag_total,
-    fuente_muni_anio = fuente_titulo
-  )
+    
+    tibble(
+        archivo = path,
+        archivo_nombre = basename(path),
+        municipio = municipio,
+        anio = anio,
+        total_label = total_label,
+        total = total_num,
+        total_texto = total_txt,
+        pagina_titulo = pag_title,
+        pagina_total = pag_total,
+        fuente_muni_anio = fuente_titulo
+    )
 }
 
 # -----------------------
 # 5) Correr todos
 # -----------------------
 res <- purrr::map_dfr(files, function(f){
-  tryCatch(
-    extract_one_pdf(f),
-    error = function(e){
-      tibble(
-        archivo = f,
-        archivo_nombre = basename(f),
-        municipio = NA_character_,
-        anio = NA_integer_,
-        total_label = NA_character_,
-        total = NA_real_,
-        total_texto = NA_character_,
-        pagina_titulo = NA_integer_,
-        pagina_total = NA_integer_,
-        fuente_muni_anio = NA_character_
-      )
-    }
-  )
+    tryCatch(
+        extract_one_pdf(f, min_total = MIN_TOTAL),
+        error = function(e){
+            tibble(
+                archivo = f,
+                archivo_nombre = basename(f),
+                municipio = NA_character_,
+                anio = NA_integer_,
+                total_label = NA_character_,
+                total = NA_real_,
+                total_texto = NA_character_,
+                pagina_titulo = NA_integer_,
+                pagina_total = NA_integer_,
+                fuente_muni_anio = NA_character_
+            )
+        }
+    )
 })
 
-# (Opcional) alerta de faltantes
+# alerta de faltantes
 faltantes <- res %>% filter(is.na(municipio) | is.na(anio) | is.na(total))
 if (nrow(faltantes) > 0) {
-  message("⚠️ Ojo: hay PDFs con municipio/año/total NA. Revisa (posible PDF escaneado): ",
-          paste(unique(faltantes$archivo_nombre), collapse = ", "))
+    message("⚠️ Ojo: hay PDFs con municipio/año/total NA. Revisa (posible PDF escaneado): ",
+            paste(unique(faltantes$archivo_nombre), collapse = ", "))
 }
 
 print(res)
