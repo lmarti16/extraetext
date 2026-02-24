@@ -35,19 +35,35 @@ if (length(files) == 0) stop("No encontré PDFs en: ", dir_pdfs)
 squish_all <- function(x) stringr::str_squish(x)
 
 remove_spaces_between_digits <- function(x){
-  # quita espacios/nbsp entre dígitos: "87, 394, 976" -> "87,394,976"
+  # normaliza nbsp
   x <- gsub("\u00A0", " ", x, fixed = TRUE)
-  gsub("(?<=\\d)\\s+(?=\\d)", "", x, perl = TRUE)
+
+  # quita espacios entre $ y dígitos
+  x <- gsub("\\$\\s+(?=\\d)", "$", x, perl = TRUE)
+
+  # separadores de miles comunes en PDFs: ,  '  ’  ´  ʼ  ′
+  seps <- ",\\'’´ʼ′"
+
+  # quita espacios/saltos entre dígito y separador
+  x <- gsub(paste0("(?<=\\d)\\s+(?=[", seps, "])"), "", x, perl = TRUE)
+
+  # quita espacios/saltos entre separador y dígito
+  x <- gsub(paste0("(?<=[", seps, "])\\s+(?=\\d)"), "", x, perl = TRUE)
+
+  # tu original: entre dígitos
+  x <- gsub("(?<=\\d)\\s+(?=\\d)", "", x, perl = TRUE)
+
+  x
 }
 
 parse_pesos_num <- function(x){
   if (is.na(x) || !nzchar(x)) return(NA_real_)
   y <- x
-  y <- gsub("\u00A0", " ", y, fixed = TRUE)        # nbsp
-  y <- gsub("[^0-9,\\.\\'’´$\\s]", "", y)          # deja dígitos, separadores y $
-  y <- gsub("\\$", "", y)                          # quita $
-  y <- gsub("[,\\'’´]", "", y)                     # quita separadores miles: , ' ’ ´
-  y <- gsub("\\s+", "", y)                         # quita espacios
+  y <- gsub("\u00A0", " ", y, fixed = TRUE)
+  y <- gsub("[^0-9,\\.\\'’´ʼ′$\\s]", "", y)  # conserva separadores
+  y <- gsub("\\$", "", y)
+  y <- gsub("[,\\'’´ʼ′]", "", y)             # elimina separadores de miles
+  y <- gsub("\\s+", "", y)
   suppressWarnings(as.numeric(y))
 }
 
@@ -55,21 +71,40 @@ parse_pesos_num <- function(x){
 pick_amount <- function(x){
   x <- remove_spaces_between_digits(x)
 
-  # $ con separadores mixtos: 92’757,499.05 / 92,757,499.05 / 92757499.05
+  seps <- ",\\'’´ʼ′"
+
+  # Montos con $:
+  # - O bien trae separadores de miles al menos una vez (54´576,875.00)
+  # - O bien trae 4+ dígitos seguidos (92757499.05)
   rx_dollar <- regex(
-    "\\$\\s*(?:[0-9]{1,3}(?:[,'’´][0-9]{3})+|[0-9]{4,})(?:\\.[0-9]{2})?",
+    paste0(
+      "\\$\\s*(?:",
+      "[0-9]{1,3}(?:[", seps, "][0-9]{3})+",
+      "|[0-9]{4,}",
+      ")(?:\\.[0-9]{2})?"
+    ),
     ignore_case = TRUE
   )
 
-  # sin $ (más restrictivo para no agarrar artículos): requiere decimales
+  # Sin $ (solo si no hay con $): exige decimales para evitar ARTÍCULO 104, etc.
   rx_plain <- regex(
-    "(?:[0-9]{1,3}(?:[,'’´][0-9]{3})+|[0-9]{4,})(?:\\.[0-9]{2})",
+    paste0(
+      "(?:",
+      "[0-9]{1,3}(?:[", seps, "][0-9]{3})+",
+      "|[0-9]{4,}",
+      ")(?:\\.[0-9]{2})"
+    ),
     ignore_case = TRUE
   )
 
-  amt <- str_extract(x, rx_dollar)
-  if (is.na(amt)) amt <- str_extract(x, rx_plain)
-  amt
+  amts <- unlist(str_extract_all(x, rx_dollar))
+  if (length(amts) == 0) amts <- unlist(str_extract_all(x, rx_plain))
+  if (length(amts) == 0) return(NA_character_)
+
+  nums <- vapply(amts, parse_pesos_num, numeric(1))
+  if (all(is.na(nums))) return(NA_character_)
+
+  amts[which.max(nums)]
 }
 
 # Normaliza (mayúsculas + sin acentos) para búsquedas robustas
