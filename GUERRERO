@@ -27,7 +27,7 @@ suppressPackageStartupMessages({
 # -----------------------
 # Config
 # -----------------------
-dir_pdfs <- "C:/Users/lmart/Downloads/Leyes Ingreso/guerrero/2026"
+dir_pdfs <- "C:/Users/lmart/Downloads/Leyes Ingreso/guerrero/2025"
 MIN_TOTAL <- 1e6
 
 files <- list.files(dir_pdfs, pattern = "\\.pdf$", full.names = TRUE, ignore.case = TRUE)
@@ -376,6 +376,6 @@ print(res)
 # -----------------------
 # 6) Exportar a Excel
 # -----------------------
-out_xlsx <- file.path(dir_pdfs, "ingresos_guerrero_2026__municipio_total.xlsx")
+out_xlsx <- file.path(dir_pdfs, "ingresos_guerrero_2025__municipio_total.xlsx")
 openxlsx::write.xlsx(res, out_xlsx, overwrite = TRUE)
 message("✅ Excel guardado en: ", out_xlsx)
