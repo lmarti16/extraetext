@@ -1,8 +1,9 @@
-https://www.legisver.gob.mx/gaceta/gacetaLXVII/AnexoD12.pdf# =========================================================
-# VERACRUZ: INGRESOS 2025 + PRESUPUESTO 2026 POR MUNICIPIO
+# =========================================================
+# VERACRUZ: LEYES DE INGRESOS 2025 VS 2026 POR MUNICIPIO
+# AnexoD12.pdf  -> ingreso_2025
+# AnexoC70.pdf  -> ingreso_2026
 # =========================================================
 
-# Si no los tienes:
 # install.packages(c("pdftools", "stringr", "dplyr", "readr", "purrr", "tibble", "openxlsx"))
 
 suppressPackageStartupMessages({
@@ -17,8 +18,11 @@ suppressPackageStartupMessages({
 # ---------------------------------------------------------
 # 1) RUTAS
 # ---------------------------------------------------------
-pdf_ingresos_2025 <- "C:/Users/lmart/Downloads/AnexoD12.pdf"
-pdf_presupuesto_2026 <- "C:/Users/lmart/Downloads/AnexoC70.pdf"
+pdf_2025 <- "C:/Users/lmart/Downloads/AnexoD12.pdf"
+pdf_2026 <- "C:/Users/lmart/Downloads/AnexoC70.pdf"
+
+salida_csv  <- "C:/Users/lmart/Downloads/veracruz_ingresos_2025_2026.csv"
+salida_xlsx <- "C:/Users/lmart/Downloads/veracruz_ingresos_2025_2026.xlsx"
 
 # ---------------------------------------------------------
 # 2) FUNCIONES AUXILIARES
@@ -32,8 +36,7 @@ normaliza_texto_pdf <- function(path_pdf) {
   txt <- gsub("[ ]{2,}", " ", txt)
   txt <- gsub("\n{2,}", "\n", txt)
   txt <- gsub("[[:space:]]+", " ", txt)
-  txt <- str_squish(txt)
-  txt
+  stringr::str_squish(txt)
 }
 
 limpia_municipio <- function(x) {
@@ -44,12 +47,32 @@ limpia_municipio <- function(x) {
     str_trim()
 }
 
-extrae_bloques <- function(texto, patron_encabezado) {
+convierte_numero <- function(x) {
+  readr::parse_number(
+    x,
+    locale = readr::locale(grouping_mark = ",", decimal_mark = ".")
+  )
+}
+
+extrae_bloques_municipio <- function(texto, year) {
+  # CORTE CORRECTO DEL MUNICIPIO:
+  # toma solo el nombre antes de "DEL ESTADO DE VERACRUZ..."
+  patron_encabezado <- regex(
+    paste0(
+      "LEY\\s+DE\\s+INGRESOS\\s+DEL\\s+MUNICIPIO\\s+DE\\s+",
+      "(.+?)",
+      "(?=\\s+DEL\\s+ESTADO\\s+DE\\s+VERACRUZ\\s+DE\\s+IGNACIO\\s+DE\\s+LA\\s+LLAVE,?\\s+",
+      "CORRESPONDIENTE\\s+AL\\s+EJERCICIO\\s+FISCAL\\s+DEL\\s+A(?:ÑO|NO)\\s+",
+      year, ")"
+    ),
+    ignore_case = TRUE
+  )
+
   locs <- str_locate_all(texto, patron_encabezado)[[1]]
   mats <- str_match_all(texto, patron_encabezado)[[1]]
 
   if (nrow(locs) == 0) {
-    stop("No encontré encabezados con ese patrón.")
+    stop(paste0("No encontré encabezados de Ley de Ingresos para ", year, "."))
   }
 
   municipios <- mats[, 2]
@@ -67,149 +90,79 @@ extrae_bloques <- function(texto, patron_encabezado) {
   )
 }
 
-extrae_primera_cifra <- function(texto, patrones_total) {
-  for (pat in patrones_total) {
-    mm <- str_match(texto, regex(pat, ignore_case = TRUE))
+extrae_total_ordinario <- function(bloque) {
+  patrones <- c(
+    "TOTAL\\s+DE\\s+INGRESOS\\s+ORDINARIOS\\s*\\$?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})|[0-9]+(?:\\.[0-9]{2})?)",
+    "TOTAL\\s+DE\\s+INGRESOS\\s+ORDINARIOS[^0-9]{0,100}([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})|[0-9]+(?:\\.[0-9]{2})?)"
+  )
+
+  for (pat in patrones) {
+    mm <- str_match(bloque, regex(pat, ignore_case = TRUE))
     if (!is.na(mm[1, 2])) return(mm[1, 2])
   }
+
   return(NA_character_)
 }
 
-convierte_numero <- function(x) {
-  parse_number(
-    x,
-    locale = locale(grouping_mark = ",", decimal_mark = ".")
-  )
-}
-
-# ---------------------------------------------------------
-# 3) EXTRAER INGRESOS 2025
-# ---------------------------------------------------------
-extraer_ingresos_2025 <- function(path_pdf) {
-
+extraer_ley_ingresos <- function(path_pdf, year, nombre_columna) {
   texto <- normaliza_texto_pdf(path_pdf)
 
-  # CORRECCIÓN IMPORTANTE:
-  # el municipio se corta justo antes de "DEL ESTADO DE VERACRUZ..."
-  patron_encabezado_2025 <- regex(
-    paste0(
-      "LEY\\s+DE\\s+INGRESOS\\s+DEL\\s+MUNICIPIO\\s+DE\\s+",
-      "(.+?)",
-      "(?=\\s+DEL\\s+ESTADO\\s+DE\\s+VERACRUZ\\s+DE\\s+IGNACIO\\s+DE\\s+LA\\s+LLAVE,?\\s+",
-      "CORRESPONDIENTE\\s+AL\\s+EJERCICIO\\s+FISCAL\\s+DEL\\s+A(?:ÑO|NO)\\s+2025)"
-    ),
-    ignore_case = TRUE
-  )
+  bloques <- extrae_bloques_municipio(texto, year)
 
-  bloques <- extrae_bloques(texto, patron_encabezado_2025)
-
-  patrones_total_2025 <- c(
-    "TOTAL\\s+DE\\s+INGRESOS\\s+ORDINARIOS\\s*\\$?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})|[0-9]+(?:\\.[0-9]{2})?)",
-    "TOTAL\\s+DE\\s+INGRESOS\\s+ORDINARIOS[^0-9]{0,80}([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})|[0-9]+(?:\\.[0-9]{2})?)"
-  )
-
-  res <- bloques |>
+  out <- bloques |>
     mutate(
-      ingreso_2025_txt = map_chr(bloque, extrae_primera_cifra, patrones_total = patrones_total_2025),
-      ingreso_2025 = convierte_numero(ingreso_2025_txt)
+      total_txt = map_chr(bloque, extrae_total_ordinario),
+      total_num = convierte_numero(total_txt)
     ) |>
-    select(municipio, ingreso_2025)
+    select(municipio, total_num)
 
-  res
+  names(out)[2] <- nombre_columna
+  out
 }
 
 # ---------------------------------------------------------
-# 4) EXTRAER PRESUPUESTO 2026
+# 3) EXTRAER 2025 Y 2026
 # ---------------------------------------------------------
-extraer_presupuesto_2026 <- function(path_pdf) {
+ing_2025 <- extraer_ley_ingresos(
+  path_pdf = pdf_2025,
+  year = 2025,
+  nombre_columna = "ingreso_2025"
+)
 
-  texto <- normaliza_texto_pdf(path_pdf)
+ing_2026 <- extraer_ley_ingresos(
+  path_pdf = pdf_2026,
+  year = 2026,
+  nombre_columna = "ingreso_2026"
+)
 
-  # Probables encabezados del anexo de presupuesto
-  posibles_encabezados <- c(
-    paste0(
-      "PRESUPUESTO\\s+DE\\s+EGRESOS\\s+DEL\\s+MUNICIPIO\\s+DE\\s+",
-      "(.+?)",
-      "(?=\\s+DEL\\s+ESTADO\\s+DE\\s+VERACRUZ\\s+DE\\s+IGNACIO\\s+DE\\s+LA\\s+LLAVE,?\\s+",
-      "CORRESPONDIENTE\\s+AL\\s+EJERCICIO\\s+FISCAL\\s+DEL\\s+A(?:ÑO|NO)\\s+2026)"
-    ),
-    paste0(
-      "PRESUPUESTO\\s+DE\\s+EGRESOS\\s+MUNICIPAL\\s+DEL\\s+MUNICIPIO\\s+DE\\s+",
-      "(.+?)",
-      "(?=\\s+DEL\\s+ESTADO\\s+DE\\s+VERACRUZ\\s+DE\\s+IGNACIO\\s+DE\\s+LA\\s+LLAVE,?\\s+",
-      "CORRESPONDIENTE\\s+AL\\s+EJERCICIO\\s+FISCAL\\s+DEL\\s+A(?:ÑO|NO)\\s+2026)"
-    )
-  )
-
-  bloques <- NULL
-  usado <- NULL
-
-  for (pat in posibles_encabezados) {
-    prueba <- tryCatch(extrae_bloques(texto, regex(pat, ignore_case = TRUE)), error = function(e) NULL)
-    if (!is.null(prueba) && nrow(prueba) > 0) {
-      bloques <- prueba
-      usado <- pat
-      break
-    }
-  }
-
-  if (is.null(bloques)) {
-    stop("No encontré los encabezados del presupuesto 2026. Revisa el texto exacto del PDF.")
-  }
-
-  # Posibles nombres del total dentro del presupuesto
-  patrones_total_2026 <- c(
-    "TOTAL\\s+DEL\\s+PRESUPUESTO\\s+DE\\s+EGRESOS\\s*\\$?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})|[0-9]+(?:\\.[0-9]{2})?)",
-    "TOTAL\\s+PRESUPUESTO\\s+DE\\s+EGRESOS\\s*\\$?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})|[0-9]+(?:\\.[0-9]{2})?)",
-    "TOTAL\\s+DE\\s+EGRESOS\\s*\\$?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})|[0-9]+(?:\\.[0-9]{2})?)",
-    "PRESUPUESTO\\s+TOTAL\\s*\\$?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]{2})|[0-9]+(?:\\.[0-9]{2})?)"
-  )
-
-  res <- bloques |>
-    mutate(
-      presupuesto_2026_txt = map_chr(bloque, extrae_primera_cifra, patrones_total = patrones_total_2026),
-      presupuesto_2026 = convierte_numero(presupuesto_2026_txt)
-    ) |>
-    select(municipio, presupuesto_2026)
-
-  attr(res, "patron_usado") <- usado
-  res
-}
-
-# ---------------------------------------------------------
-# 5) EJECUTAR
-# ---------------------------------------------------------
-ing_2025 <- extraer_ingresos_2025(pdf_ingresos_2025)
-pres_2026 <- extraer_presupuesto_2026(pdf_presupuesto_2026)
-
-comparativo <- full_join(ing_2025, pres_2026, by = "municipio") |>
+comparativo <- full_join(ing_2025, ing_2026, by = "municipio") |>
   arrange(municipio)
 
 # ---------------------------------------------------------
-# 6) REVISIÓN
+# 4) REVISIONES
 # ---------------------------------------------------------
-cat("Municipios ingresos 2025:", nrow(ing_2025), "\n")
-cat("Municipios presupuesto 2026:", nrow(pres_2026), "\n")
-cat("Municipios comparativo:", nrow(comparativo), "\n\n")
+cat("Municipios 2025:", nrow(ing_2025), "\n")
+cat("Municipios 2026:", nrow(ing_2026), "\n")
+cat("Municipios en comparativo:", nrow(comparativo), "\n\n")
 
-cat("Sin ingreso 2025:\n")
+cat("Faltantes 2025:\n")
 print(comparativo |> filter(is.na(ingreso_2025)) |> select(municipio), n = Inf)
 
-cat("\nSin presupuesto 2026:\n")
-print(comparativo |> filter(is.na(presupuesto_2026)) |> select(municipio), n = Inf)
+cat("\nFaltantes 2026:\n")
+print(comparativo |> filter(is.na(ingreso_2026)) |> select(municipio), n = Inf)
 
 cat("\nChequeo SAN RAFAEL:\n")
 print(comparativo |> filter(str_detect(municipio, "SAN RAFAEL")))
 
 # ---------------------------------------------------------
-# 7) GUARDAR CSV Y EXCEL
+# 5) GUARDAR CSV
 # ---------------------------------------------------------
-salida_csv <- "C:/Users/lmart/Downloads/Veracruz_ingresos_2025_vs_presupuesto_2026.csv"
-write_csv(comparativo, salida_csv)
+readr::write_csv(comparativo, salida_csv)
 
+# ---------------------------------------------------------
+# 6) GUARDAR EXCEL
+# ---------------------------------------------------------
 if (requireNamespace("openxlsx", quietly = TRUE)) {
-  salida_xlsx <- "C:/Users/lmart/Downloads/Veracruz_ingresos_2025_vs_presupuesto_2026.xlsx"
-
   wb <- openxlsx::createWorkbook()
 
   openxlsx::addWorksheet(wb, "comparativo")
@@ -218,11 +171,12 @@ if (requireNamespace("openxlsx", quietly = TRUE)) {
   openxlsx::addWorksheet(wb, "ingresos_2025")
   openxlsx::writeData(wb, "ingresos_2025", ing_2025)
 
-  openxlsx::addWorksheet(wb, "presupuesto_2026")
-  openxlsx::writeData(wb, "presupuesto_2026", pres_2026)
+  openxlsx::addWorksheet(wb, "ingresos_2026")
+  openxlsx::writeData(wb, "ingresos_2026", ing_2026)
 
   openxlsx::saveWorkbook(wb, salida_xlsx, overwrite = TRUE)
   cat("\nExcel guardado en:\n", salida_xlsx, "\n")
 }
 
 cat("\nCSV guardado en:\n", salida_csv, "\n")
+print(comparativo, n = Inf)
