@@ -1,7 +1,20 @@
 # ============================================================
 # HIDALGO | LEYES DE INGRESOS MUNICIPALES 2026
-# Extrae el TOTAL DE INGRESOS desde los alcances 5 a 24
-# del 31 de diciembre de 2025 del Periódico Oficial.
+# ------------------------------------------------------------
+# Qué hace:
+# 1) Recorre los alcances 5 a 24 del 31 de diciembre de 2025
+#    del Periódico Oficial de Hidalgo.
+# 2) Descarga los PDFs en:
+#    C:/Users/lmart/Downloads/Leyes Ingreso/hidalgo
+# 3) Detecta cada Ley de Ingresos municipal 2026.
+# 4) Extrae el TOTAL DE INGRESOS aunque la redacción cambie.
+# 5) Exporta CSV + XLSX con resultados y un log.
+# ------------------------------------------------------------
+# Referencias oficiales:
+# - Alcance 5 del 31/12/2025: decrees 454 a 457. :contentReference[oaicite:0]{index=0}
+# - Compendio municipal 2026: lista los decretos 454 a 537
+#   y señala que el 537 es vigencia de Mixquiahuala 2025
+#   para regir en 2026. :contentReference[oaicite:1]{index=1}
 # ============================================================
 
 # -----------------------------
@@ -19,7 +32,7 @@ if (length(instalar) > 0) install.packages(instalar)
 invisible(lapply(packs, library, character.only = TRUE))
 
 # -----------------------------
-# 2) HELPERS
+# 2) CONFIG
 # -----------------------------
 `%||%` <- function(x, y) {
   if (is.null(x) || length(x) == 0 || all(is.na(x))) y else x
@@ -28,7 +41,7 @@ invisible(lapply(packs, library, character.only = TRUE))
 ua <- "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 base_site <- "https://periodico.hidalgo.gob.mx"
 
-dir_base <- "C:/Users/lmart/Downloads/HIDALGO_INGRESOS_2026"
+dir_base <- "C:/Users/lmart/Downloads/Leyes Ingreso/hidalgo"
 dir_pdfs <- fs::path(dir_base, "pdfs")
 dir_logs <- fs::path(dir_base, "logs")
 
@@ -36,10 +49,13 @@ fs::dir_create(dir_base, recurse = TRUE)
 fs::dir_create(dir_pdfs, recurse = TRUE)
 fs::dir_create(dir_logs, recurse = TRUE)
 
+# -----------------------------
+# 3) HELPERS WEB
+# -----------------------------
 obtener_html <- function(url) {
   httr2::request(url) |>
     httr2::req_user_agent(ua) |>
-    httr2::req_timeout(60) |>
+    httr2::req_timeout(90) |>
     httr2::req_retry(max_tries = 3) |>
     httr2::req_perform() |>
     httr2::resp_body_string()
@@ -61,29 +77,49 @@ extrae_urls_relevantes <- function(html_txt, base_url) {
 
   hits_raw <- stringr::str_extract_all(
     html_txt,
-    "(https?://[^\"'\\s>]+(?:\\.pdf|\\?wpdmpro=[^\"'\\s>]+|\\?wpdmdl=\\d+[^\"'\\s>]*|download=[^\"'\\s>]+)|/[^\"'\\s>]+(?:\\.pdf|\\?wpdmpro=[^\"'\\s>]+|\\?wpdmdl=\\d+[^\"'\\s>]*))"
+    "(https?://[^\"'\\s>]+(?:\\.pdf(?:\\?[^\"'\\s>]*)?|\\?wpdmpro=[^\"'\\s>]+|\\?wpdmdl=\\d+[^\"'\\s>]*|download=[^\"'\\s>]+)|/[^\"'\\s>]+(?:\\.pdf(?:\\?[^\"'\\s>]*)?|\\?wpdmpro=[^\"'\\s>]+|\\?wpdmdl=\\d+[^\"'\\s>]*))"
   )[[1]]
 
   hits_raw <- hits_raw[!is.na(hits_raw) & nzchar(hits_raw)]
   hits_abs <- tryCatch(xml2::url_absolute(hits_raw, base_url), error = function(e) hits_raw)
 
   urls <- unique(c(hrefs_abs, hits_abs))
+  urls <- unique(urls)
 
-  urls |>
-    unique() |>
-    .[stringr::str_detect(., "POEHpdfpublic/.+\\.pdf|\\?wpdmpro=|\\?wpdmdl=|download=")] |>
-    .[!stringr::str_detect(., "file-type-icons|\\.svg$|\\.png$|\\.jpg$|\\.jpeg$|\\.webp$")]
+  urls <- urls[
+    stringr::str_detect(
+      urls,
+      "POEHpdfpublic/.+\\.pdf(?:\\?.*)?$|\\?wpdmpro=|\\?wpdmdl=|download="
+    )
+  ]
+
+  urls <- urls[
+    !stringr::str_detect(
+      urls,
+      "file-type-icons|\\.svg$|\\.png$|\\.jpg$|\\.jpeg$|\\.webp$"
+    )
+  ]
+
+  urls
 }
 
 es_pdf_valido <- function(path_pdf) {
   tryCatch({
-    pdftools::pdf_info(path_pdf)
-    TRUE
+    info <- pdftools::pdf_info(path_pdf)
+    !is.null(info$pages) && info$pages >= 1
   }, error = function(e) FALSE)
 }
 
 descargar_primero_que_funcione <- function(candidatos, destfile) {
   candidatos <- unique(candidatos[!is.na(candidatos) & nzchar(candidatos)])
+
+  if (length(candidatos) == 0) {
+    return(list(
+      ok = FALSE,
+      url = NA_character_,
+      intentos = tibble::tibble(url = character(), ok = logical(), detalle = character())
+    ))
+  }
 
   intentos <- tibble::tibble(
     url = candidatos,
@@ -97,9 +133,11 @@ descargar_primero_que_funcione <- function(candidatos, destfile) {
     detalle_i <- NA_character_
 
     tryCatch({
+      if (fs::file_exists(destfile)) fs::file_delete(destfile)
+
       httr2::request(u) |>
         httr2::req_user_agent(ua) |>
-        httr2::req_timeout(120) |>
+        httr2::req_timeout(180) |>
         httr2::req_retry(max_tries = 2) |>
         httr2::req_perform(path = destfile)
 
@@ -107,9 +145,7 @@ descargar_primero_que_funcione <- function(candidatos, destfile) {
         fs::file_info(destfile)$size > 1024 &&
         es_pdf_valido(destfile)
 
-      if (!ok_i) {
-        detalle_i <- "Descargó algo, pero no fue un PDF válido."
-      }
+      if (!ok_i) detalle_i <- "Descargó algo, pero no fue PDF válido."
     }, error = function(e) {
       detalle_i <<- conditionMessage(e)
       ok_i <<- FALSE
@@ -125,8 +161,6 @@ descargar_primero_que_funcione <- function(candidatos, destfile) {
         intentos = intentos
       ))
     }
-
-    if (fs::file_exists(destfile)) fs::file_delete(destfile)
   }
 
   list(
@@ -136,25 +170,26 @@ descargar_primero_que_funcione <- function(candidatos, destfile) {
   )
 }
 
-# Fallback por si el scraping del botón falla.
-# Primero intenta resolver el link real del HTML;
-# esto solo entra como último recurso.
+# Rutas típicas del portal; quedan como respaldo si el botón de descarga cambia
 candidatos_fallback_pdf <- function(alcance) {
-  c(
+  unique(c(
     sprintf("%s/POEHpdfpublic/2025_dic_31_alc%s_52.pdf", base_site, alcance),
-    sprintf("%s/POEHpdfpublic/2025_dic_31_al%s_52.pdf",  base_site, alcance),
     sprintf("%s/POEHpdfpublic/2025_dic_31_alc%02d_52.pdf", base_site, alcance),
-    sprintf("%s/POEHpdfpublic/2025_dic_31_al%02d_52.pdf",  base_site, alcance)
-  ) |>
-    unique()
+    sprintf("%s/POEHpdfpublic/2025_dic_31_al%s_52.pdf", base_site, alcance),
+    sprintf("%s/POEHpdfpublic/2025_dic_31_al%02d_52.pdf", base_site, alcance)
+  ))
 }
 
 resolver_candidatos_pdf_evento <- function(event_url, alcance) {
   html_evt <- obtener_html(event_url)
   urls_evt <- extrae_urls_relevantes(html_evt, event_url)
 
-  directos <- urls_evt[stringr::str_detect(urls_evt, "POEHpdfpublic/.+\\.pdf$|\\.pdf(?:\\?.*)?$|\\?wpdmdl=")]
-  wpdmpro  <- urls_evt[stringr::str_detect(urls_evt, "\\?wpdmpro=")]
+  directos <- urls_evt[stringr::str_detect(
+    urls_evt,
+    "POEHpdfpublic/.+\\.pdf(?:\\?.*)?$|\\.pdf(?:\\?.*)?$|\\?wpdmdl="
+  )]
+
+  wpdmpro <- urls_evt[stringr::str_detect(urls_evt, "\\?wpdmpro=")]
 
   out <- directos
 
@@ -164,17 +199,23 @@ resolver_candidatos_pdf_evento <- function(event_url, alcance) {
       if (is.na(html_w)) next
 
       urls_w <- extrae_urls_relevantes(html_w, w)
+
       out <- c(
         out,
-        urls_w[stringr::str_detect(urls_w, "POEHpdfpublic/.+\\.pdf$|\\.pdf(?:\\?.*)?$|\\?wpdmdl=")]
+        urls_w[stringr::str_detect(
+          urls_w,
+          "POEHpdfpublic/.+\\.pdf(?:\\?.*)?$|\\.pdf(?:\\?.*)?$|\\?wpdmdl="
+        )]
       )
     }
   }
 
-  c(out, candidatos_fallback_pdf(alcance)) |>
-    unique()
+  unique(c(out, candidatos_fallback_pdf(alcance)))
 }
 
+# -----------------------------
+# 4) HELPERS TEXTO/PDF
+# -----------------------------
 normaliza_texto_pdf <- function(x) {
   x |>
     enc2utf8() |>
@@ -195,19 +236,17 @@ leer_pdf_normalizado <- function(path_pdf) {
 extraer_bloques_ley <- function(texto) {
   patron_inicio <- paste0(
     "(",
-    "DECRETO\\s+NUMERO\\.?\\s*\\d+\\s*[-–.]?\\s*LXVI\\s+)?",
-    "(?:QUE\\s+CONTIENE\\s+LA\\s+)?",
-    "LEY\\s+DE\\s+INGRESOS\\s+PARA\\s+EL\\s+MUNICIPIO\\s+DE\\s+[A-Z .'-]+?,\\s+HIDALGO,?\\s+CORRESPONDIENTE\\s+AL\\s+EJERCICIO\\s+FISCAL\\s+2026",
+    "(DECRETO\\s+NUMERO\\.?\\s*\\d+\\s*[-–.]?\\s*LXVI\\s+)?",
+    "(QUE\\s+CONTIENE\\s+LA\\s+)?",
+    "LEY\\s+DE\\s+INGRESOS\\s+PARA\\s+EL\\s+MUNICIPIO\\s+DE\\s+[A-Z .'-]+?,?\\s+HIDALGO,?\\s+CORRESPONDIENTE\\s+AL\\s+EJERCICIO\\s+FISCAL\\s+2026",
     "|",
-    "DECRETO\\s+NUMERO\\.?\\s*537\\s*[-–.]?\\s*LXVI\\s+QUE\\s+DECLARA\\s+LA\\s+VIGENCIA\\s+DE\\s+LA\\s+LEY\\s+DE\\s+INGRESOS\\s+DEL\\s+MUNICIPIO\\s+DE\\s+MIXQUIAHUALA\\s+DE\\s+JUAREZ",
-    ")"
+    "DECRETO\\s+NUMERO\\.?\\s*537\\s*[-–.]?\\s*LXVI\\s+QUE\\s+DECLARA\\s+LA\\s+VIGENCIA\\s+DE\\s+LA\\s+LEY\\s+DE\\s+INGRESOS\\s+DEL\\s+MUNICIPIO\\s+DE\\s+MIXQUIAHUALA\\s+DE\\s+JUAREZ"
+    ,")"
   )
 
   locs <- stringr::str_locate_all(texto, patron_inicio)[[1]]
 
-  if (is.null(locs) || nrow(locs) == 0) {
-    return(character(0))
-  }
+  if (is.null(locs) || nrow(locs) == 0) return(character(0))
 
   starts <- locs[, 1]
   ends <- c(starts[-1] - 1, nchar(texto))
@@ -218,19 +257,18 @@ extraer_bloques_ley <- function(texto) {
 extraer_municipio <- function(bloque) {
   m <- stringr::str_match(
     bloque,
-    "LEY\\s+DE\\s+INGRESOS\\s+PARA\\s+EL\\s+MUNICIPIO\\s+DE\\s+([A-Z .'-]+?),\\s+HIDALGO"
+    "LEY\\s+DE\\s+INGRESOS\\s+PARA\\s+EL\\s+MUNICIPIO\\s+DE\\s+([A-Z .'-]+?),?\\s+HIDALGO"
   )[, 2]
 
   if (is.na(m)) {
     m <- stringr::str_match(
       bloque,
-      "VIGENCIA\\s+DE\\s+LA\\s+LEY\\s+DE\\s+INGRESOS\\s+DEL\\s+MUNICIPIO\\s+DE\\s+([A-Z .'-]+?),\\s+HIDALGO"
+      "VIGENCIA\\s+DE\\s+LA\\s+LEY\\s+DE\\s+INGRESOS\\s+DEL\\s+MUNICIPIO\\s+DE\\s+([A-Z .'-]+?),?\\s+HIDALGO"
     )[, 2]
   }
 
-  m |>
-    stringr::str_squish() |>
-    (\(z) ifelse(is.na(z), NA_character_, z))()
+  m <- stringr::str_squish(m)
+  ifelse(is.na(m), NA_character_, m)
 }
 
 extraer_decreto <- function(bloque) {
@@ -240,34 +278,53 @@ extraer_decreto <- function(bloque) {
   )[, 2]
 }
 
+limpia_numero_monetario <- function(x) {
+  if (length(x) == 0 || is.na(x) || !nzchar(x)) return(NA_real_)
+  x <- gsub("\\s+", "", x)
+  x <- gsub(",", "", x)
+  suppressWarnings(as.numeric(x))
+}
+
+# Busca TOTAL DE INGRESOS y variantes cercanas
 extraer_total_bloque <- function(bloque) {
   patrones <- c(
-    "TOTAL\\s+DE\\s+INGRESOS\\s*[:\\$]?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.\\d{2})?)",
-    "TOTAL\\s+INGRESOS\\s*[:\\$]?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.\\d{2})?)",
-    "INGRESOS\\s+TOTALES\\s*[:\\$]?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.\\d{2})?)",
-    "TOTAL\\s+GENERAL\\s*[:\\$]?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.\\d{2})?)",
-    "IMPORTE\\s+TOTAL\\s*[:\\$]?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.\\d{2})?)",
-    "MONTO\\s+TOTAL\\s*[:\\$]?\\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\\.\\d{2})?)"
+    "TOTAL\\s+DE\\s+INGRESOS\\s*[:\\$]?\\s*([0-9]{1,3}(?:,\\s?[0-9]{3})*(?:\\.\\d{2})?)",
+    "TOTAL\\s+INGRESOS\\s*[:\\$]?\\s*([0-9]{1,3}(?:,\\s?[0-9]{3})*(?:\\.\\d{2})?)",
+    "INGRESOS\\s+TOTALES\\s*[:\\$]?\\s*([0-9]{1,3}(?:,\\s?[0-9]{3})*(?:\\.\\d{2})?)",
+    "IMPORTE\\s+TOTAL\\s*[:\\$]?\\s*([0-9]{1,3}(?:,\\s?[0-9]{3})*(?:\\.\\d{2})?)",
+    "MONTO\\s+TOTAL\\s*[:\\$]?\\s*([0-9]{1,3}(?:,\\s?[0-9]{3})*(?:\\.\\d{2})?)",
+    "SE\\s+PERCIBIRAN\\s+LOS\\s+INGRESOS\\s+POR\\s+UN\\s+TOTAL\\s+DE\\s*[:\\$]?\\s*([0-9]{1,3}(?:,\\s?[0-9]{3})*(?:\\.\\d{2})?)",
+    "LA\\s+HACIENDA\\s+PUBLICA\\s+DEL\\s+MUNICIPIO.*?PERCIBIRA.*?TOTAL\\s+DE\\s*[:\\$]?\\s*([0-9]{1,3}(?:,\\s?[0-9]{3})*(?:\\.\\d{2})?)"
   )
 
   for (p in patrones) {
     m <- stringr::str_match(bloque, p)[, 2]
-    if (!is.na(m)) return(m)
+    if (!is.na(m)) return(stringr::str_replace_all(m, "\\s+", ""))
   }
 
-  # Fallback: busca números cercanos a la palabra TOTAL
-  ventanas <- stringr::str_extract_all(bloque, "TOTAL.{0,140}")[[1]]
-  if (length(ventanas) > 0) {
-    nums <- stringr::str_match(
-      ventanas,
-      "([0-9]{1,3}(?:,[0-9]{3})*(?:\\.\\d{2})?)"
-    )[, 2]
+  # Ventanas alrededor de palabras clave
+  ventanas <- c(
+    stringr::str_extract_all(bloque, "TOTAL.{0,220}")[[1]],
+    stringr::str_extract_all(bloque, "ARTICULO\\s+1.{0,450}")[[1]],
+    stringr::str_extract_all(bloque, "PERCIBIRA.{0,300}")[[1]]
+  )
 
+  ventanas <- ventanas[!is.na(ventanas)]
+
+  if (length(ventanas) > 0) {
+    nums <- stringr::str_match_all(
+      ventanas,
+      "([0-9]{1,3}(?:,\\s?[0-9]{3})*(?:\\.\\d{2})?)"
+    )
+
+    nums <- unlist(purrr::map(nums, ~ .x[, 2]))
     nums <- nums[!is.na(nums)]
 
     if (length(nums) > 0) {
-      nums_num <- as.numeric(gsub(",", "", nums))
-      return(nums[which.max(nums_num)])
+      nums_limpios <- stringr::str_replace_all(nums, "\\s+", "")
+      nums_num <- suppressWarnings(as.numeric(gsub(",", "", nums_limpios)))
+      if (all(is.na(nums_num))) return(NA_character_)
+      return(nums_limpios[which.max(nums_num)])
     }
   }
 
@@ -296,7 +353,11 @@ extraer_desde_pdf <- function(path_pdf, alcance, pdf_url = NA_character_) {
 
   purrr::map_dfr(bloques, function(b) {
     total_txt <- extraer_total_bloque(b)
-    tipo_dec <- if (stringr::str_detect(b, "VIGENCIA\\s+DE\\s+LA\\s+LEY\\s+DE\\s+INGRESOS")) {
+
+    tipo_dec <- if (stringr::str_detect(
+      b,
+      "VIGENCIA\\s+DE\\s+LA\\s+LEY\\s+DE\\s+INGRESOS"
+    )) {
       "Vigencia 2025 que regira 2026"
     } else {
       "Ley de ingresos 2026"
@@ -308,7 +369,7 @@ extraer_desde_pdf <- function(path_pdf, alcance, pdf_url = NA_character_) {
       municipio = extraer_municipio(b),
       tipo_decreto = tipo_dec,
       total_ingresos_texto = total_txt,
-      total_ingresos = if (!is.na(total_txt)) as.numeric(gsub(",", "", total_txt)) else NA_real_,
+      total_ingresos = limpia_numero_monetario(total_txt),
       pdf_local = path_pdf,
       pdf_url = pdf_url,
       hallo_total = !is.na(total_txt)
@@ -317,7 +378,7 @@ extraer_desde_pdf <- function(path_pdf, alcance, pdf_url = NA_character_) {
 }
 
 # -----------------------------
-# 3) ALCANCES 5 A 24
+# 5) ALCANCES 5 A 24
 # -----------------------------
 alcances <- tibble::tibble(
   alcance = 5:24,
@@ -329,7 +390,7 @@ alcances <- tibble::tibble(
 )
 
 # -----------------------------
-# 4) RESOLVER Y DESCARGAR PDFS
+# 6) DESCARGAR PDFS
 # -----------------------------
 descargas <- alcances |>
   dplyr::mutate(
@@ -351,8 +412,29 @@ log_descargas <- descargas |>
 
 readr::write_csv(log_descargas, fs::path(dir_logs, "log_descargas.csv"), na = "")
 
+# Log detallado de intentos
+log_intentos <- purrr::map2_dfr(
+  descargas$alcance,
+  descargas$descarga,
+  function(alcance, obj) {
+    tb <- obj$intentos
+    if (nrow(tb) == 0) {
+      tibble::tibble(
+        alcance = alcance,
+        url = NA_character_,
+        ok = FALSE,
+        detalle = "Sin candidatos detectados"
+      )
+    } else {
+      dplyr::mutate(tb, alcance = alcance, .before = 1)
+    }
+  }
+)
+
+readr::write_csv(log_intentos, fs::path(dir_logs, "log_intentos_descarga.csv"), na = "")
+
 # -----------------------------
-# 5) EXTRAER TOTALES DE INGRESOS
+# 7) EXTRAER TOTALES
 # -----------------------------
 res <- purrr::pmap_dfr(
   list(descargas$pdf_local, descargas$alcance, descargas$pdf_url, descargas$descargado),
@@ -384,7 +466,7 @@ res <- purrr::pmap_dfr(
   dplyr::arrange(alcance, suppressWarnings(as.numeric(decreto)), municipio)
 
 # -----------------------------
-# 6) EXPORTAR
+# 8) EXPORTAR RESULTADOS
 # -----------------------------
 salida_csv  <- fs::path(dir_base, "HIDALGO_LEYES_INGRESOS_2026_TOTALES.csv")
 salida_xlsx <- fs::path(dir_base, "HIDALGO_LEYES_INGRESOS_2026_TOTALES.xlsx")
@@ -395,31 +477,36 @@ writexl::write_xlsx(
   list(
     totales = res,
     descargas = log_descargas,
+    intentos = log_intentos,
     pendientes = dplyr::filter(res, is.na(total_ingresos) | !hallo_total)
   ),
   salida_xlsx
 )
 
 # -----------------------------
-# 7) RESUMEN EN CONSOLA
+# 9) RESUMEN EN CONSOLA
 # -----------------------------
 cat("\n========================================\n")
 cat("HIDALGO | LEYES DE INGRESOS 2026\n")
 cat("========================================\n")
-cat("Directorio base: ", dir_base, "\n", sep = "")
+cat("Carpeta base: ", dir_base, "\n", sep = "")
 cat("PDFs descargados: ", sum(descargas$descargado), " de ", nrow(descargas), "\n", sep = "")
 cat("Registros detectados: ", nrow(res), "\n", sep = "")
+cat("Con total detectado: ", sum(!is.na(res$total_ingresos)), "\n", sep = "")
 cat("Sin total detectado: ", sum(is.na(res$total_ingresos)), "\n", sep = "")
 cat("CSV:  ", salida_csv, "\n", sep = "")
 cat("XLSX: ", salida_xlsx, "\n", sep = "")
 
-cat("\n--- Muestra: Acatlan / Mixquiahuala ---\n")
+cat("\n--- Muestra: ACATLAN / MIXQUIAHUALA ---\n")
 print(
   res |>
     dplyr::filter(
-      stringr::str_detect(municipio %||% "", "ACATLAN|MIXQUIAHUALA")
+      stringr::str_detect(dplyr::coalesce(municipio, ""), "ACATLAN|MIXQUIAHUALA")
     ) |>
-    dplyr::select(alcance, decreto, municipio, tipo_decreto, total_ingresos_texto, total_ingresos)
+    dplyr::select(
+      alcance, decreto, municipio, tipo_decreto,
+      total_ingresos_texto, total_ingresos
+    )
 )
 
 cat("\n--- Pendientes por revisar ---\n")
